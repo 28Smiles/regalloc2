@@ -44,6 +44,7 @@ pub(crate) mod domtree;
 pub mod indexset;
 pub(crate) mod ion;
 pub mod spiller;
+pub mod linear;
 pub mod moves;
 pub(crate) mod postorder;
 pub mod ssa;
@@ -52,6 +53,7 @@ pub mod ssa;
 mod index;
 
 use alloc::vec::Vec;
+use std::ops::Not;
 pub use index::{Block, Inst, InstRange};
 
 pub mod checker;
@@ -240,6 +242,33 @@ impl PRegSet {
     pub fn union_from(&mut self, other: PRegSet) {
         self.bits[0] |= other.bits[0];
         self.bits[1] |= other.bits[1];
+    }
+}
+
+impl Not for PRegSet {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self {
+            bits: [!self.bits[0], !self.bits[1]],
+        }
+    }
+}
+
+impl core::ops::BitOr for PRegSet {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            bits: [self.bits[0] | rhs.bits[0], self.bits[1] | rhs.bits[1]],
+        }
+    }
+}
+
+impl core::ops::BitAnd for PRegSet {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self {
+            bits: [self.bits[0] & rhs.bits[0], self.bits[1] & rhs.bits[1]],
+        }
     }
 }
 
