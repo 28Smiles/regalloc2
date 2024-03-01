@@ -243,6 +243,20 @@ impl PRegSet {
         self.bits[0] |= other.bits[0];
         self.bits[1] |= other.bits[1];
     }
+
+    /// Find the first register in the set that is set to 1, and return
+    /// it. If no register is set, return `None`.
+    pub fn first(&self) -> Option<PReg> {
+        if self.bits[0] != 0 {
+            let index = self.bits[0].trailing_zeros();
+            Some(PReg::from_index(index as usize))
+        } else if self.bits[1] != 0 {
+            let index = self.bits[1].trailing_zeros();
+            Some(PReg::from_index(index as usize + 128))
+        } else {
+            None
+        }
+    }
 }
 
 impl Not for PRegSet {

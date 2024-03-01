@@ -1,10 +1,13 @@
+use std::vec;
 use std::vec::Vec;
 use smallvec::SmallVec;
 
 use crate::{Allocation, Block, Edit, Function, Inst, InstPosition, InstRange, MachineEnv, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet, ProgPoint, RegAllocError, RegClass, SpillSlot, VReg};
+use crate::linear::allocation_state::AllocationState;
 
 mod usage_tracker;
 mod allocation_tracker;
+mod allocation_state;
 
 #[derive(Copy, Clone, Debug)]
 struct PRegAlloc {
@@ -15,15 +18,11 @@ struct PRegAlloc {
 struct Env<'a, F: Function> {
     func: &'a F,
     mach_env: &'a MachineEnv,
-
-    num_spillslots: u32,
-    edits: Vec<(ProgPoint, Edit)>,
-    // Spill slots
-    free_spillslots_per_class: [Vec<SpillSlot>; 3],
-    spillslot_allocations: Vec<VReg>,
+    allocation_state: AllocationState<'a, F>,
     // Allocations
     inst_alloc_offsets: Vec<u32>,
     allocs: Vec<Allocation>,
+    edits: Vec<(ProgPoint, Edit)>,
     // Blockparams
     block_params_offsets: Vec<usize>,
     block_params: Vec<Allocation>,
@@ -31,101 +30,147 @@ struct Env<'a, F: Function> {
     current_block: Block,
     current_block_inst_range: InstRange,
     current_inst: Inst,
-    // PRegs
-    allocated_pregs: PRegSet,
-    preg_allocations: Vec<PRegAlloc>,
-    // VRegs
-    vreg_allocations: Vec<Allocation>,
-    vregs_in_use: Vec<VReg>,
-    // Live ranges
-    vreg_live_ranges: Vec<InstRange>,
 }
 
 impl<'a, F: Function> Env<'a, F> {
     #[inline]
-    fn to(mut self, block: Block, params: &[Allocation]) -> Self {
-        self.current_block = block;
-        self.current_block_inst_range = self.func.block_insts(block);
-        self.current_inst = self.current_block_inst_range.first();
-        // Reset the PRegs
-        self.allocated_pregs = PRegSet::empty();
-        // Reset the spill slots
-        for &vreg in &self.vregs_in_use {
-            let alloc = self.vreg_allocations[vreg.vreg()];
-            if let Some(spillslot) = alloc.as_stack() {
-                self.free_spillslots_per_class[vreg.class() as usize].push(spillslot);
-            }
-            self.vreg_allocations[vreg.vreg()] = Allocation::none();
-            self.vreg_live_ranges[vreg.vreg()] = InstRange::new(
-                self.current_block_inst_range.last(),
-                self.current_block_inst_range.first(),
-            );
+    fn new(func: &'a F, mach_env: &'a MachineEnv) -> Self {
+        let allocation_state = AllocationState::new(func, mach_env);
+        let mut inst_alloc_offsets = Vec::with_capacity(func.num_insts());
+        let mut allocs = 0;
+        for inst in 0..func.num_insts() {
+            inst_alloc_offsets.push(allocs);
+            allocs += func.inst_operands(Inst::new(inst)).len() as u32;
         }
-        self.vregs_in_use.clear();
-        // Set the blockparams
-        for (&vreg, &alloc) in self.func.block_params(block).iter().zip(params) {
-            self.vreg_allocations[vreg.vreg()] = alloc;
-            self.vregs_in_use.push(vreg);
-            if let Some(spillslot) = alloc.as_stack() {
-                self.free_spillslots_per_class[vreg.class() as usize].retain(|&s| s != spillslot);
-            }
-            if let Some(preg) = alloc.as_reg() {
-                self.allocated_pregs.insert(preg);
-                self.preg_allocations[preg.index()].vreg = vreg;
-                self.preg_allocations[preg.index()].last_use = self.current_inst;
-            }
+        let allocs = vec![Allocation::none(); allocs as usize];
+        let edits = Vec::with_capacity(func.num_insts() * 4);
+        let mut block_params_offsets = Vec::with_capacity(func.num_blocks() + 1);
+        let mut block_params = 0;
+        for block in 0..func.num_blocks() {
+            block_params_offsets.push(block_params);
+            block_params += func.block_params(Block::new(block)).len();
         }
-        // Discover the live ranges
-        for inst in self.current_block_inst_range.iter() {
-            for operand in self.func.inst_operands(inst) {
-                let vreg = operand.vreg();
-                let InstRange(start, end) = self.vreg_live_ranges[vreg.vreg()];
-                self.vreg_live_ranges[vreg.vreg()] = InstRange(start.min(inst), end.max(inst));
-            }
+        block_params_offsets.push(block_params);
+        let block_params = vec![Allocation::none(); block_params];
+        let current_block = Block::invalid();
+        let current_block_inst_range = InstRange(Inst::invalid(), Inst::invalid());
+        let current_inst = Inst::invalid();
+
+        Self {
+            func,
+            mach_env,
+            allocation_state,
+            inst_alloc_offsets,
+            allocs,
+            edits,
+            block_params_offsets,
+            block_params,
+            current_block,
+            current_block_inst_range,
+            current_inst,
         }
-
-        self
-    }
-
-    /// Allocate the block parameters. (Will only work on branch instructions)
-    #[inline]
-    fn allocate_args(&mut self) -> Result<(), RegAllocError> {
-        if !self.func.is_branch(self.current_inst) {
-            return Ok(());
-        }
-
-        for (idx, &target_block) in self.func.block_succs(self.current_block).iter().enumerate() {
-            let block_params = self.block_param_allocations(target_block);
-            let vreg_source = self.func.branch_blockparams(target_block, self.current_inst, idx);
-            let vreg_dest = self.func.block_params(target_block);
-
-            for (&source_vreg, (&dest_vreg, &dest_allocation)) in vreg_source.iter().zip(vreg_dest.iter().zip(block_params)) {
-                let source_allocation = self.vreg_allocations[source_vreg.vreg()];
-                if dest_allocation != source_allocation {
-                    self.edits.push((
-                        ProgPoint::new(self.current_inst, InstPosition::Before),
-                        Edit::Move {
-                            from: source_allocation,
-                            to: dest_allocation,
-                        },
-                    ));
-                    self.vreg_allocations[dest_vreg.vreg()] = dest_allocation;
-                    self.vregs_in_use.push(dest_vreg);
-                }
-            }
-        }
-
-        Ok(())
     }
 
     #[inline]
     fn block_param_allocations(&self, block: Block) -> &[Allocation] {
         let index = block.index();
-        debug_assert!(index < self.block_params_offsets.len() - 1);
-        let start = self.block_params_offsets[index];
-        let end = self.block_params_offsets.get(index + 1).copied().unwrap_or(self.block_params.len());
+        let offset = self.block_params_offsets[index];
+        let end = self.block_params_offsets[index + 1];
 
-        &self.block_params[start..end]
+        &self.block_params[offset..end]
+    }
+
+    /// Generate the edits for the parameters of the successor blocks.
+    #[inline]
+    fn allocate_block_params(&mut self) {
+        debug_assert!(self.current_inst != self.current_block_inst_range.last());
+        let succs = self.func.block_succs(self.current_block);
+        for (idx, &succ) in succs.iter().enumerate() {
+            let params = self.func.branch_blockparams(succ, self.current_inst, idx);
+            for (&param, &allocation) in params.iter().zip(self.block_param_allocations(succ)) {
+                self.allocation_state.allocate_vreg(self.current_inst, param, allocation);
+            }
+        }
+    }
+
+    #[inline]
+    fn generate_arguments(&mut self) {
+        debug_assert!(self.current_inst != self.current_block_inst_range.first());
+        let preds = self.func.block_preds(self.current_block);
+        let mut blocked_pregs = PRegSet::empty();
+        let mut blocked_preg_count = [0; 3];
+        let mut used_regs = [0; 3];
+        for &pred in preds {
+            // We block fixed registers from the last instruction of the predecessor blocks.
+            let last_inst = self.current_block_inst_range.last();
+            let operands = self.func.inst_operands(last_inst);
+            let mut this_used_regs = [0; 3];
+            for operand in operands {
+                if let OperandConstraint::FixedReg(preg) = operand.constraint() {
+                    if blocked_pregs.contains(preg) {
+                        continue;
+                    }
+                    blocked_pregs.add(preg);
+                    blocked_preg_count[preg.class() as usize] += 1;
+                    this_used_regs[preg.class() as usize] += 1;
+                }
+                if let OperandConstraint::Reg = operand.constraint() {
+                    this_used_regs[operand.class() as usize] += 1;
+                }
+            }
+
+            for reg_class in [RegClass::Int, RegClass::Float, RegClass::Vector] {
+
+            }
+        }
+
+        // Block additional pregs needed for the jump instructions
+        for _ in 0..used_regs {
+
+        }
+
+        let args = self.func.block_args(self.current_block);
+        let offset = self.block_params_offsets[self.current_block.index()];
+        for (idx, &arg) in args.iter().enumerate() {
+            let allocation = self.allocation_state.get_vreg_allocation(arg);
+            if let Some(preg) = allocation.as_reg() {
+                if blocked_pregs.contains(preg) {
+                    // Needs to move to another slot.
+                    self.free_preg(preg, blocked_pregs);
+                    continue;
+                }
+            }
+            self.block_params[offset + idx] = allocation;
+        }
+
+        // Now we free additional pregs if needed.
+        todo!("generate_arguments")
+    }
+
+    /// Free the specified preg, the value will be moved to a new allocation.
+    /// other preg > spillslot
+    #[inline]
+    fn free_preg(&mut self, preg: PReg, blocked_pregs: PRegSet) {
+        let vreg = self.allocation_state.get_preg_vreg(preg);
+        let allocation = if let Some(preg) = self.allocation_state.find_free_preg(vreg.class(), blocked_pregs) {
+            Allocation::reg(preg)
+        } else {
+            if let Some(spillslot) = self.allocation_state.find_free_spillslot(vreg.class()) {
+                Allocation::stack(spillslot)
+            } else {
+                self.allocation_state.allocate_spillslot(vreg)
+            }
+        };
+
+        self.allocation_state.free_allocation(vreg);
+        self.edits.push((
+            ProgPoint::new(self.current_inst, InstPosition::Before),
+            Edit::Move {
+                from: Allocation::reg(preg),
+                to: allocation,
+            },
+        ));
+        self.allocation_state.allocate_vreg(self.current_inst, vreg, allocation);
     }
 
     /// Allocate the operands of the current instruction.
@@ -541,146 +586,5 @@ impl<'a, F: Function> Env<'a, F> {
         }
 
         Ok(())
-    }
-
-    #[inline]
-    fn find_scratch_reg(
-        &self,
-        reserved_reg_set: PRegSet,
-        reg_class: RegClass,
-    ) -> Option<PReg> {
-        if let Some(preg) = self.mach_env.scratch_by_class[reg_class as usize] {
-            if !reserved_reg_set.contains(preg) {
-                return Some(preg);
-            }
-        }
-
-        if let Some(preg) = self.find_free_preg(reg_class, reserved_reg_set) {
-            return Some(preg);
-        }
-
-        None
-    }
-
-    #[inline]
-    fn get_vreg_allocation(&self, vreg: VReg) -> Option<Allocation> {
-        let allocation = self.vreg_allocations[vreg.vreg()];
-
-        if allocation.is_some() {
-            Some(allocation)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn allocate_spillslot(&mut self, vreg: VReg) -> SpillSlot {
-        let spillslots = &mut self.free_spillslots_per_class[vreg.class() as usize];
-        if let Some(spillslot) = spillslots.pop() {
-            return spillslot
-        }
-
-        let size = self.func.spillslot_size(vreg.class()) as u32;
-        let mut offset = self.num_spillslots;
-        // Align up to `size`.
-        debug_assert!(size.is_power_of_two());
-        offset = (offset + size - 1) & !(size - 1);
-        let slot = if self.func.multi_spillslot_named_by_last_slot() {
-            offset + size - 1
-        } else {
-            offset
-        };
-        offset += size;
-        self.num_spillslots = offset;
-
-        SpillSlot::new(slot as usize)
-    }
-
-    #[inline]
-    fn get_allocation_vreg(&mut self, allocation: Allocation) -> Option<VReg> {
-        if let Some(preg) = allocation.as_reg() {
-            Some(self.preg_allocations[preg.index()].vreg)
-        } else {
-            if let Some(spillslot) = allocation.as_stack() {
-                Some(self.spillslot_allocations[spillslot.index()])
-            } else {
-                None
-            }
-        }
-    }
-
-    #[inline]
-    fn free_allocation_state(&mut self, allocation: Allocation) {
-        let vreg = if let Some(preg) = allocation.as_reg() {
-            self.allocated_pregs.remove(preg);
-            self.preg_allocations[preg.index()].vreg
-        } else {
-            if let Some(spillslot) = allocation.as_stack() {
-                let vreg = self.spillslot_allocations[spillslot.index()];
-                self.spillslot_allocations[spillslot.index()] = VReg::invalid();
-                self.free_spillslots_per_class[vreg.class() as usize].push(spillslot);
-                vreg
-            } else {
-                return;
-            }
-        };
-        self.vreg_allocations[vreg.vreg()] = Allocation::none();
-    }
-
-    #[inline]
-    fn set_allocation_state(&mut self, vreg: VReg, allocation: Allocation) {
-        self.vreg_allocations[vreg.vreg()] = allocation;
-        if let Some(preg) = allocation.as_reg() {
-            self.allocated_pregs.insert(preg);
-            self.preg_allocations[preg.index()].vreg = vreg;
-            self.preg_allocations[preg.index()].last_use = self.current_inst;
-        }
-        if let Some(spillslot) = allocation.as_stack() {
-            self.spillslot_allocations[spillslot.index()] = vreg;
-        }
-    }
-
-    #[inline]
-    fn find_free_preg(&self, class: RegClass, blocked_pregs: PRegSet) -> Option<PReg> {
-        for pregs in [
-            &self.mach_env.preferred_regs_by_class[class as usize],
-            &self.mach_env.non_preferred_regs_by_class[class as usize],
-        ] {
-            for &preg in pregs {
-                if !blocked_pregs.contains(preg) {
-                    return Some(preg);
-                }
-            }
-        }
-
-        None
-    }
-
-    #[inline]
-    fn find_freeable_preg(&self, vreg: VReg, blocked_pregs: PRegSet) -> Result<PReg, RegAllocError> {
-        let mut best_preg = PReg::invalid();
-        let mut best_use = Inst::new(0);
-        for pregs in [
-            &self.mach_env.preferred_regs_by_class[vreg.class() as usize],
-            &self.mach_env.non_preferred_regs_by_class[vreg.class() as usize],
-        ] {
-            for &preg in pregs {
-                if blocked_pregs.contains(preg) {
-                    continue;
-                }
-
-                let last_use = self.preg_allocations[preg.index()].last_use;
-                if last_use <= best_use {
-                    best_preg = preg;
-                    best_use = last_use;
-                }
-            }
-        }
-
-        if best_preg.is_invalid() {
-            return Err(RegAllocError::TooManyLiveRegs);
-        }
-
-        Ok(best_preg)
     }
 }
