@@ -43,7 +43,7 @@ pub(crate) mod cfg;
 pub(crate) mod domtree;
 pub mod indexset;
 pub(crate) mod ion;
-pub mod spiller;
+//pub mod spiller;
 pub mod linear;
 pub mod moves;
 pub(crate) mod postorder;
@@ -243,20 +243,6 @@ impl PRegSet {
         self.bits[0] |= other.bits[0];
         self.bits[1] |= other.bits[1];
     }
-
-    /// Find the first register in the set that is set to 1, and return
-    /// it. If no register is set, return `None`.
-    pub fn first(&self) -> Option<PReg> {
-        if self.bits[0] != 0 {
-            let index = self.bits[0].trailing_zeros();
-            Some(PReg::from_index(index as usize))
-        } else if self.bits[1] != 0 {
-            let index = self.bits[1].trailing_zeros();
-            Some(PReg::from_index(index as usize + 128))
-        } else {
-            None
-        }
-    }
 }
 
 impl Not for PRegSet {
@@ -332,6 +318,122 @@ impl From<&MachineEnv> for PRegSet {
         }
 
         res
+    }
+}
+
+/// A hw register set. Used to represent clobbers
+/// efficiently.
+///
+/// The set is `Copy` and is guaranteed to have constant, and small,
+/// size, as it is based on a bitset internally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct HwRegSet {
+    bits: u64,
+}
+
+impl HwRegSet {
+    /// Create an empty set.
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    /// Returns whether the given register is part of the set.
+    pub fn contains(&self, reg: PReg) -> bool {
+        let reg = reg.hw_enc();
+        debug_assert!(reg < 64);
+        self.bits & (1u64 << reg) != 0
+    }
+
+    /// Returns whether the given register is part of the set.
+    pub fn contains_idx(&self, reg: usize) -> bool {
+        debug_assert!(reg < 64);
+        self.bits & (1u64 << reg) != 0
+    }
+
+    /// Add a hardware register to the set, returning the new value.
+    pub const fn with(self, reg: PReg) -> Self {
+        let reg = reg.hw_enc();
+        debug_assert!(reg < 64);
+        Self {
+            bits: self.bits | (1u64 << reg),
+        }
+    }
+
+    /// Add a hardware register to the set.
+    pub fn add(&mut self, reg: PReg) {
+        let reg = reg.hw_enc();
+        debug_assert!(reg < 64);
+        self.bits |= 1u64 << reg;
+    }
+
+    /// Add a hardware register to the set.
+    pub fn add_idx(&mut self, reg: usize) {
+        debug_assert!(reg < 64);
+        self.bits |= 1u64 << reg;
+    }
+
+    /// Remove a hardware register from the set.
+    pub fn remove(&mut self, reg: PReg) {
+        let reg = reg.hw_enc();
+        debug_assert!(reg < 64);
+        self.bits &= !(1u64 << reg);
+    }
+
+    /// Remove a hardware register from the set.
+    pub fn remove_idx(&mut self, reg: usize) {
+        debug_assert!(reg < 64);
+        self.bits &= !(1u64 << reg);
+    }
+}
+
+impl Not for HwRegSet {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self { bits: !self.bits }
+    }
+}
+
+impl core::ops::BitOr for HwRegSet {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            bits: self.bits | rhs.bits,
+        }
+    }
+}
+
+impl core::ops::BitAnd for HwRegSet {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self {
+            bits: self.bits & rhs.bits,
+        }
+    }
+}
+
+impl IntoIterator for HwRegSet {
+    type Item = usize;
+    type IntoIter = HwRegSetIter;
+    fn into_iter(self) -> HwRegSetIter {
+        HwRegSetIter { bits: self.bits }
+    }
+}
+
+pub struct HwRegSetIter {
+    bits: u64,
+}
+
+impl Iterator for HwRegSetIter {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.bits != 0 {
+            let index = self.bits.trailing_zeros();
+            self.bits &= !(1u64 << index);
+            Some(index as usize)
+        } else {
+            None
+        }
     }
 }
 
