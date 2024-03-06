@@ -218,6 +218,10 @@ impl<'a, F: Function> AllocationState<'a, F> {
 
     #[inline]
     pub fn get_vreg_allocation(&self, vreg: VReg) -> Allocation {
+        if vreg.vreg() >= self.vreg_allocations.len() {
+            return Allocation::none();
+        }
+
         self.vreg_allocations[vreg.vreg()]
     }
 

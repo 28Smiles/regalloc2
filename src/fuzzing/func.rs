@@ -23,13 +23,21 @@ pub enum InstOpcode {
 
 #[derive(Clone, Debug)]
 pub struct InstData {
-    op: InstOpcode,
-    operands: Vec<Operand>,
-    clobbers: Vec<PReg>,
-    is_safepoint: bool,
+    pub op: InstOpcode,
+    pub operands: Vec<Operand>,
+    pub clobbers: Vec<PReg>,
+    pub is_safepoint: bool,
 }
 
 impl InstData {
+    pub fn op(operands: Vec<Operand>) -> InstData {
+        InstData {
+            op: InstOpcode::Op,
+            operands,
+            clobbers: vec![],
+            is_safepoint: false,
+        }
+    }
     pub fn branch() -> InstData {
         InstData {
             op: InstOpcode::Branch,
@@ -141,7 +149,7 @@ impl Function for Func {
     }
 }
 
-struct FuncBuilder {
+pub(crate) struct FuncBuilder {
     postorder: Vec<Block>,
     idom: Vec<Block>,
     f: Func,
@@ -149,7 +157,7 @@ struct FuncBuilder {
 }
 
 impl FuncBuilder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         FuncBuilder {
             postorder: vec![],
             idom: vec![],
@@ -181,6 +189,12 @@ impl FuncBuilder {
         b
     }
 
+    pub fn add_vreg(&mut self, class: RegClass) -> VReg {
+        let vreg = VReg::new(self.f.num_vregs, class);
+        self.f.num_vregs += 1;
+        vreg
+    }
+
     pub fn add_inst(&mut self, block: Block, data: InstData) {
         self.insts_per_block[block.index()].push(data);
     }
@@ -210,7 +224,7 @@ impl FuncBuilder {
         );
     }
 
-    fn finalize(mut self) -> Func {
+    pub fn finalize(mut self) -> Func {
         for (blocknum, blockrange) in self.f.blocks.iter_mut().enumerate() {
             let begin_inst = self.f.insts.len();
             for inst in &self.insts_per_block[blocknum] {

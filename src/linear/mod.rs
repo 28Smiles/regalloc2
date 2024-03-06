@@ -416,8 +416,9 @@ impl<'a, F: Function> Env<'a, F> {
         });
 
         let offset = self.inst_alloc_offsets[self.current_inst.index()] as usize;
-        let mut fixed_regs_early = HwRegSet::empty();
-        let mut fixed_regs_late = HwRegSet::empty();
+        let mut fixed_regs_early: HwRegSet = HwRegSet::empty();
+        let mut fixed_regs_late: HwRegSet = self.func.inst_clobbers(self.current_inst).into();
+
         let (allocation_instructions_def, allocation_instructions_use) = {
             let allocation_instruction_pos = allocation_instructions.iter()
                 .position(|allocation_instruction| allocation_instruction.operand.kind() == OperandKind::Use)
@@ -877,11 +878,36 @@ impl<'a, F: Function> Env<'a, F> {
                         } else {
                             Allocation::reg(preg)
                         };
+                        let previous_allocation = self.allocation_state.get_vreg_allocation(vreg);
+                        if previous_allocation.is_some() {
+                            self.edits.push((
+                                ProgPoint::new(self.current_inst, InstPosition::Before),
+                                Edit::Move {
+                                    from: allocation,
+                                    to: previous_allocation,
+                                },
+                            ));
+                            self.allocation_state.free_allocation(vreg);
+                        }
                         self.allocs[offset + allocation_instruction.allocation_idx] = allocation;
                         fixed_regs_early.add(preg);
                         self.allocation_state.allocate_vreg(self.current_inst, operand.vreg(), allocation);
                     },
                     (OperandConstraint::Reg, OperandKind::Use) => {
+                        // We start by checking if the vreg is already allocated, i.e. it is needed later.
+                        let prev_allocation = self.allocation_state.get_vreg_allocation(operand.vreg());
+                        if prev_allocation.is_some() {
+                            // The vreg is needed later.
+                            if let Some(preg) = prev_allocation.as_reg() {
+                                if !(fixed_regs_early | fixed_regs_late).contains(preg) {
+                                    // The vreg is already allocated to a preg.
+                                    self.allocs[offset + allocation_instruction.allocation_idx] = prev_allocation;
+                                    continue;
+                                }
+                                // The vreg is already allocated to a preg.
+                            }
+                        }
+
                         let allocation = if self.allocs[offset + allocation_instruction.allocation_idx].is_some() {
                             self.allocs[offset + allocation_instruction.allocation_idx]
                         } else {
@@ -916,10 +942,28 @@ impl<'a, F: Function> Env<'a, F> {
                             }
 
                         };
+
+                        if prev_allocation.is_some() {
+                            self.edits.push((
+                                ProgPoint::new(self.current_inst, InstPosition::Before),
+                                Edit::Move {
+                                    from: allocation,
+                                    to: prev_allocation,
+                                },
+                            ));
+                            self.allocation_state.allocate_vreg(self.current_inst, operand.vreg(), Allocation::none());
+                        }
+
                         self.allocs[offset + allocation_instruction.allocation_idx] = allocation;
                         self.allocation_state.allocate_vreg(self.current_inst, operand.vreg(), allocation);
                     },
                     (OperandConstraint::Any, OperandKind::Use) => {
+                        let prev_allocation = self.allocation_state.get_vreg_allocation(operand.vreg());
+                        if prev_allocation.is_some() {
+                            self.allocs[offset + allocation_instruction.allocation_idx] = prev_allocation;
+                            continue;
+                        }
+
                         let allocation = if self.allocs[offset + allocation_instruction.allocation_idx].is_some() {
                             self.allocs[offset + allocation_instruction.allocation_idx]
                         } else {
@@ -941,11 +985,27 @@ impl<'a, F: Function> Env<'a, F> {
                         self.allocation_state.allocate_vreg(self.current_inst, operand.vreg(), allocation);
                     },
                     (OperandConstraint::Stack, OperandKind::Use) => {
+                        let prev_allocation = self.allocation_state.get_vreg_allocation(operand.vreg());
                         let allocation = if self.allocs[offset + allocation_instruction.allocation_idx].is_some() {
                             self.allocs[offset + allocation_instruction.allocation_idx]
                         } else {
-                            Allocation::stack(self.allocation_state.allocate_spillslot(operand.vreg()))
+                            if let Some(spillslot) = prev_allocation.as_stack() {
+                                Allocation::stack(spillslot)
+                            } else {
+                                Allocation::stack(self.allocation_state.allocate_spillslot(operand.vreg()))
+                            }
                         };
+
+                        if prev_allocation.is_reg() {
+                            self.allocation_state.free_allocation(operand.vreg());
+                            self.edits.push((
+                                ProgPoint::new(self.current_inst, InstPosition::After),
+                                Edit::Move {
+                                    from: allocation,
+                                    to: prev_allocation,
+                                },
+                            ));
+                        }
                         self.allocs[offset + allocation_instruction.allocation_idx] = allocation;
                         self.allocation_state.allocate_vreg(self.current_inst, operand.vreg(), allocation);
                     },
@@ -958,25 +1018,74 @@ impl<'a, F: Function> Env<'a, F> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fuzzing"))]
 mod test {
-    use std::println;
+    use std::{println, vec};
 
+    use crate::fuzzing::func::{Func, FuncBuilder, InstData, InstOpcode, machine_env};
+    use crate::{Operand, OperandConstraint, OperandKind, OperandPos, RegClass};
     use crate::fuzzing::arbitrary::{Arbitrary, Unstructured};
-    use crate::fuzzing::func::{Func, machine_env, Options};
 
     #[test]
     fn test() {
-        println!("test");
-        let mut unstructured = Unstructured::new(&[4, 5, 6, 7, 6]);
         let env = machine_env();
-        let func = Func::arbitrary_with_options(&mut unstructured, &Options {
-            reused_inputs: true,
-            fixed_regs: true,
-            fixed_nonallocatable: true,
-            clobbers: false,
-            reftypes: false,
-        }).unwrap();
+        let mut func = FuncBuilder::new();
+        let b1 = func.add_block();
+        let v0 = func.add_vreg(RegClass::Float);
+        let v1 = func.add_vreg(RegClass::Float);
+        func.add_inst(b1, InstData::op(vec![
+            Operand::new(v0, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+            Operand::new(v1, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+        ]));
+        let v2 = func.add_vreg(RegClass::Float);
+        let v3 = func.add_vreg(RegClass::Float);
+        func.add_inst(b1, InstData::op(vec![
+            Operand::new(v2, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+            Operand::new(v3, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+        ]));
+        let v4 = func.add_vreg(RegClass::Float);
+        func.add_inst(b1, InstData::op(vec![
+            Operand::new(v0, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v2, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v4, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+        ]));
+        let v5 = func.add_vreg(RegClass::Float);
+        func.add_inst(b1, InstData::op(vec![
+            Operand::new(v1, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v2, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v3, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v5, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+        ]));
+        func.add_inst(b1, InstData::branch());
+        func.set_block_params_out(b1, vec![vec![v4, v5]]);
+        let b2 = func.add_block();
+        let v6 = func.add_vreg(RegClass::Float);
+        let v7 = func.add_vreg(RegClass::Float);
+        func.set_block_params_in(b2, &vec![v6, v7]);
+        let v8 = func.add_vreg(RegClass::Float);
+        func.add_inst(b2, InstData::op(vec![
+            Operand::new(v6, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v7, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early),
+            Operand::new(v8, OperandConstraint::Reg, OperandKind::Def, OperandPos::Late),
+        ]));
+        func.add_inst(b2, InstData {
+            op: InstOpcode::Ret,
+            operands: vec![Operand::new(v8, OperandConstraint::Reg, OperandKind::Use, OperandPos::Early)],
+            clobbers: vec![],
+            is_safepoint: false,
+        });
+        func.add_edge(b1, b2);
+        let func = func.finalize();
+        println!("{:?}", &func);
+        let allocator = super::Env::new(&func, &env);
+        let result = allocator.run().unwrap();
+        println!("{:?}", result);
+    }
+
+    #[test]
+    fn arbitrary() {
+        let env = machine_env();
+        let func = Func::arbitrary(&mut Unstructured::new([4,5,6,7,3,2,6,8,9,3,2].as_slice())).unwrap();
         println!("{:?}", &func);
         let allocator = super::Env::new(&func, &env);
         let result = allocator.run().unwrap();

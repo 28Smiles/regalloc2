@@ -437,6 +437,21 @@ impl Iterator for HwRegSetIter {
     }
 }
 
+impl From<PRegSet> for HwRegSet {
+    fn from(value: PRegSet) -> Self {
+        let ab = value.bits[0];
+        let cd = value.bits[1];
+        let a = ab & (u64::MAX as u128);
+        let b = ab >> 64;
+        let c = cd & (u64::MAX as u128);
+        let d = cd >> 64;
+
+        Self {
+            bits: a as u64 | b as u64 | c as u64 | d as u64
+        }
+    }
+}
+
 /// A virtual register. Contains a virtual register number and a
 /// class.
 ///
