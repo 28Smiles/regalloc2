@@ -43,8 +43,7 @@ pub(crate) mod cfg;
 pub(crate) mod domtree;
 pub mod indexset;
 pub(crate) mod ion;
-//pub mod spiller;
-pub mod linear;
+pub(crate) mod anion;
 pub mod moves;
 pub(crate) mod postorder;
 pub mod ssa;
@@ -243,6 +242,15 @@ impl PRegSet {
         self.bits[0] |= other.bits[0];
         self.bits[1] |= other.bits[1];
     }
+
+    pub fn to_hw(&self, reg_class: RegClass) -> HwRegSet {
+        let class = reg_class as usize;
+        let idx = class >> 1;
+        let shift = (class & 1) * 64;
+        let bits = (self.bits[idx] >> shift) & (u64::MAX as u128);
+
+        HwRegSet { bits: bits as u64 }
+    }
 }
 
 impl Not for PRegSet {
@@ -334,11 +342,13 @@ pub struct HwRegSet {
 
 impl HwRegSet {
     /// Create an empty set.
+    #[inline(always)]
     pub const fn empty() -> Self {
         Self { bits: 0 }
     }
 
     /// Returns whether the given register is part of the set.
+    #[inline(always)]
     pub fn contains(&self, reg: PReg) -> bool {
         let reg = reg.hw_enc();
         debug_assert!(reg < 64);
@@ -346,12 +356,14 @@ impl HwRegSet {
     }
 
     /// Returns whether the given register is part of the set.
+    #[inline(always)]
     pub fn contains_idx(&self, reg: usize) -> bool {
         debug_assert!(reg < 64);
         self.bits & (1u64 << reg) != 0
     }
 
     /// Add a hardware register to the set, returning the new value.
+    #[inline(always)]
     pub const fn with(self, reg: PReg) -> Self {
         let reg = reg.hw_enc();
         debug_assert!(reg < 64);
@@ -361,6 +373,7 @@ impl HwRegSet {
     }
 
     /// Add a hardware register to the set.
+    #[inline(always)]
     pub fn add(&mut self, reg: PReg) {
         let reg = reg.hw_enc();
         debug_assert!(reg < 64);
@@ -368,12 +381,14 @@ impl HwRegSet {
     }
 
     /// Add a hardware register to the set.
+    #[inline(always)]
     pub fn add_idx(&mut self, reg: usize) {
         debug_assert!(reg < 64);
         self.bits |= 1u64 << reg;
     }
 
     /// Remove a hardware register from the set.
+    #[inline(always)]
     pub fn remove(&mut self, reg: PReg) {
         let reg = reg.hw_enc();
         debug_assert!(reg < 64);
@@ -381,14 +396,23 @@ impl HwRegSet {
     }
 
     /// Remove a hardware register from the set.
+    #[inline(always)]
     pub fn remove_idx(&mut self, reg: usize) {
         debug_assert!(reg < 64);
         self.bits &= !(1u64 << reg);
+    }
+
+    /// Is the set empty?
+    #[inline(always)]
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
     }
 }
 
 impl Not for HwRegSet {
     type Output = Self;
+
+    #[inline(always)]
     fn not(self) -> Self {
         Self { bits: !self.bits }
     }
@@ -396,6 +420,8 @@ impl Not for HwRegSet {
 
 impl core::ops::BitOr for HwRegSet {
     type Output = Self;
+
+    #[inline(always)]
     fn bitor(self, rhs: Self) -> Self {
         Self {
             bits: self.bits | rhs.bits,
@@ -405,6 +431,8 @@ impl core::ops::BitOr for HwRegSet {
 
 impl core::ops::BitAnd for HwRegSet {
     type Output = Self;
+
+    #[inline(always)]
     fn bitand(self, rhs: Self) -> Self {
         Self {
             bits: self.bits & rhs.bits,
@@ -415,6 +443,8 @@ impl core::ops::BitAnd for HwRegSet {
 impl IntoIterator for HwRegSet {
     type Item = usize;
     type IntoIter = HwRegSetIter;
+
+    #[inline(always)]
     fn into_iter(self) -> HwRegSetIter {
         HwRegSetIter { bits: self.bits }
     }
@@ -426,6 +456,8 @@ pub struct HwRegSetIter {
 
 impl Iterator for HwRegSetIter {
     type Item = usize;
+
+    #[inline(always)]
     fn next(&mut self) -> Option<usize> {
         if self.bits != 0 {
             let index = self.bits.trailing_zeros();
@@ -438,6 +470,7 @@ impl Iterator for HwRegSetIter {
 }
 
 impl From<PRegSet> for HwRegSet {
+    #[inline(always)]
     fn from(value: PRegSet) -> Self {
         let ab = value.bits[0];
         let cd = value.bits[1];
@@ -1069,6 +1102,12 @@ impl core::fmt::Display for Allocation {
     }
 }
 
+impl Default for Allocation {
+    fn default() -> Self {
+        Allocation::none()
+    }
+}
+
 impl Allocation {
     /// Construct a new Allocation.
     #[inline(always)]
@@ -1476,7 +1515,7 @@ impl ProgPoint {
 }
 
 /// An instruction to insert into the program to perform some data movement.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub enum Edit {
     /// Move one allocation to another. Each allocation may be a

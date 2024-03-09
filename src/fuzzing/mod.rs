@@ -21,6 +21,9 @@ pub mod cfg {
 pub mod ion {
     pub use crate::ion::*;
 }
+pub mod anion {
+    pub use crate::anion::*;
+}
 pub mod checker {
     pub use crate::checker::*;
 }
