@@ -8,6 +8,8 @@ use preg_state::PRegState;
 use vreg_tracker::VRegTracker;
 
 use crate::{Allocation, Block, Edit, Function, Inst, InstPosition, InstRange, MachineEnv, OperandConstraint, OperandKind, OperandPos, Output, PReg, PRegSet, ProgPoint, RegAllocError, RegClass, SpillSlot, VReg};
+use crate::anion::index_set::IndexSet;
+use crate::anion::index_vec::IndexVec;
 use crate::anion::offset_vec::OffsetVec;
 use crate::anion::spillslot_state::SpillSlotState;
 
@@ -15,6 +17,8 @@ mod offset_vec;
 mod preg_state;
 mod spillslot_state;
 mod vreg_tracker;
+mod index_vec;
+mod index_set;
 
 struct State {
     pub block: Block,
@@ -35,17 +39,19 @@ impl Default for State {
     }
 }
 
-struct Edits(Vec<(ProgPoint, Edit)>);
+struct Edits(IndexVec<Edit>);
 
 impl Edits {
     #[inline]
-    pub fn new(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
+    pub fn new(instructions: usize) -> Self {
+        Self(IndexVec::new(instructions * 2))
     }
 
     #[inline]
     pub fn push(&mut self, state: &State, edit: Edit) {
-        self.0.push((ProgPoint::new(state.inst, state.pos), edit));
+        let point = ProgPoint::new(state.inst, state.pos);
+        let index = point.to_index();
+        self.0.push(index as usize, edit);
     }
 
     #[inline]
@@ -56,11 +62,14 @@ impl Edits {
     }
 
     #[inline]
-    pub fn edits(mut self) -> Vec<(ProgPoint, Edit)> {
-        self.0.reverse();
-        self.0.sort_by_key(|(point, _)| *point);
+    pub fn edits(self) -> Vec<(ProgPoint, Edit)> {
+        self.0.into_iter_block_rev()
+            .map(|(index, edits)| {
+                let point = ProgPoint::from_index(index as u32);
 
-        self.0
+                (point, edits)
+            })
+            .collect()
     }
 }
 
@@ -177,48 +186,40 @@ struct Anion<'a, F: Function> {
     func: &'a F,
     mach_env: &'a MachineEnv,
     tracker: Tracker<'a, F>,
-    block_params: OffsetVec<Allocation>,
+    block_params: IndexVec<(VReg, Allocation)>,
     allocations: OffsetVec<Allocation>,
     edits: Edits,
     state: State,
-    done_processing: Vec<u64>,
+    done_processing: IndexSet,
+    vreg_set: IndexSet,
 }
 
 impl<'a, F: Function> Anion<'a, F> {
     #[inline]
     pub fn new(func: &'a F, mach_env: &'a MachineEnv) -> Self {
-        let block_params = OffsetVec::new(
-            (0..func.num_blocks()).map(|block| func.block_params(Block::new(block)).len() as u32)
-        );
-        let allocations = OffsetVec::new(
-            (0..func.num_insts()).map(|inst| func.inst_operands(Inst::new(inst)).len() as u32)
-        );
-
         Self {
             func,
             mach_env,
             tracker: Tracker::new(func, mach_env),
-            block_params,
-            allocations,
+            block_params: IndexVec::new_with_capacity(
+                func.num_blocks(),
+                (0..func.num_blocks()).map(|block| func.block_params(Block::new(block)).len()).sum()
+            ),
+            allocations: OffsetVec::new(
+                (0..func.num_insts()).map(|inst| func.inst_operands(Inst::new(inst)).len() as u32)
+            ),
             edits: Edits::new(func.num_insts() * 4),
             state: State::default(),
-            done_processing: vec![0; func.num_blocks() / 64 + 1],
+            done_processing: IndexSet::new(func.num_blocks()),
+            vreg_set: IndexSet::new(func.num_vregs()),
         }
     }
 
     pub fn run(mut self) -> Result<Output, RegAllocError> {
-        // The allocator is a simple linear allocator, that runs backwards through the instructions.
-        // This trick is used to remove the need for life range tracking.
-        for block in (0..self.func.num_blocks()).rev() {
-            let block = Block::new(block);
-            let last_inst = self.func.block_insns(block).last();
-            if self.func.is_ret(last_inst) {
-                self.process_block(block)?;
-            }
-        }
+        self.process_block(self.func.entry_block())?;
 
         debug_assert!(
-            (0..self.func.num_blocks()).all(|block| self.is_done_processing(Block::new(block))),
+            self.done_processing.is_full(),
             "Not all blocks are processed"
         );
 
@@ -237,19 +238,14 @@ impl<'a, F: Function> Anion<'a, F> {
         })
     }
 
-    #[inline]
-    fn done_processing(&mut self, block: Block) {
-        self.done_processing[block.index() / 64] |= 1 << (block.index() % 64);
-    }
-
-    #[inline]
-    fn is_done_processing(&self, block: Block) -> bool {
-        self.done_processing[block.index() / 64] & (1 << (block.index() % 64)) != 0
-    }
-
     fn process_block(&mut self, block: Block) -> Result<(), RegAllocError> {
-        if self.is_done_processing(block) {
+        if self.done_processing.contains(block.index()) {
             return Ok(());
+        }
+        self.done_processing.insert(block.index());
+
+        for &succ in self.func.block_succs(block) {
+            self.process_block(succ)?;
         }
 
         self.state.block = block;
@@ -257,17 +253,8 @@ impl<'a, F: Function> Anion<'a, F> {
         self.state.inst = self.state.inst_range.last();
         self.state.pos = InstPosition::After;
         self.process_insts()?;
-        self.done_processing(block);
-
-        // for inst in self.state.inst_range.iter() {
-        //     for &operand in self.func.inst_operands(inst) {
-        //         self.tracker.free(operand.vreg());
-        //     }
-        // }
-
-        for &prev in self.func.block_preds(block) {
-            self.process_block(prev)?;
-        }
+        self.state.pos = InstPosition::Before;
+        self.place_block_params()?;
 
         Ok(())
     }
@@ -275,26 +262,58 @@ impl<'a, F: Function> Anion<'a, F> {
     fn process_insts(&mut self) -> Result<(), RegAllocError> {
         debug_assert_eq!(self.state.inst, self.state.inst_range.last());
         debug_assert_eq!(self.state.pos, InstPosition::After);
+        self.state.pos = InstPosition::Before;
         self.allocate_block_params();
         for inst in self.state.inst_range.iter().rev() {
             self.state.inst = inst;
             self.state.pos = InstPosition::After;
             self.allocate_operands()?;
         }
-        self.state.pos = InstPosition::Before;
-        self.place_block_params()?;
 
         Ok(())
     }
 
     fn allocate_block_params(&mut self) {
+        log::trace!("allocate_block_params: Allocating block parameters for block {}", self.state.block.index());
         debug_assert_eq!(self.state.inst, self.state.inst_range.last());
         for (idx, &succ) in self.func.block_succs(self.state.block).iter().enumerate() {
-            let params = self.block_params.get_all(succ.index() as u32);
+            debug_assert!(self.done_processing.contains(succ.index()), "Successor block {} is not processed", succ.index());
+            let params = self.block_params.get(succ.index());
             let vregs = self.func.branch_blockparams(self.state.block, self.state.inst, idx);
-            debug_assert_eq!(params.len(), vregs.len());
-            for (&vreg, &allocation) in vregs.iter().zip(params.iter()) {
+            debug_assert!(vregs.len() <= params.len(), "Too many block parameters for block {}", succ.index());
+
+            for (&vreg, (_, allocation)) in vregs.iter().zip(params) {
+                let allocation = *allocation;
+                // We allocate the block parameters to the pregs.
+                debug_assert!(
+                    self.tracker.find(allocation)
+                        .map(|vreg| vreg == vreg)
+                        .unwrap_or(true),
+                    "Block parameter is already allocated to another vreg"
+                );
+
                 self.tracker.allocate(&self.state, vreg, allocation);
+            }
+
+            for (vreg, allocation) in &params[vregs.len()..] {
+                let vreg = *vreg;
+                let allocation = *allocation;
+                // We allocate the block parameters to the pregs.
+                debug_assert!(
+                    self.tracker.find(allocation)
+                        .map(|vreg| vreg == vreg)
+                        .unwrap_or(true),
+                    "Block parameter is already allocated to another vreg"
+                );
+
+                if let Some(current_allocation) = self.tracker.find(vreg) {
+                    debug_assert!(
+                        current_allocation == allocation,
+                        "Block parameter is already allocated to another allocation"
+                    );
+                } else {
+                    self.tracker.allocate(&self.state, vreg, allocation);
+                }
             }
         }
     }
@@ -302,21 +321,50 @@ impl<'a, F: Function> Anion<'a, F> {
     fn place_block_params(&mut self) -> Result<(), RegAllocError> {
         debug_assert_eq!(self.state.inst, self.state.inst_range.first());
         debug_assert_eq!(self.state.pos, InstPosition::Before);
-        // TODO: Check for use without def.
+        log::trace!("place_block_params: Placing block parameters for block {}", self.state.block.index());
         // We first look at the branch instructions of the previous blocks, to determine
         // which pregs are used by the branch instructions. We then block these pregs
         // for the block parameters, so we don't allocate the same preg to the block
         // parameters and the branch instruction.
         let mut blocked_argument_slots = self.find_blocked_argument_slots()?;
-        let arguments = self.func.block_params(self.state.block);
+        // First add the block parameters to the block_params indexvec.
+        self.vreg_set.clear();
+        self.block_params.extend(
+            self.state.block.index(),
+            self.func.block_params(self.state.block).iter()
+                .copied()
+                .map(|vreg| (vreg, Allocation::none()))
+        );
+        for &vreg in self.func.block_params(self.state.block) {
+            log::trace!("place_block_params: VReg {} is a block parameter", vreg);
+            self.vreg_set.insert(vreg.vreg());
+        }
+        // Now add all open vregs to the tracker.
+        for inst in self.state.inst_range.iter().rev() {
+            for operand in self.func.inst_operands(inst) {
+                if operand.kind() == OperandKind::Use {
+                    let vreg = operand.vreg();
+                    if self.tracker.find(vreg).is_some() && !self.vreg_set.contains(vreg.vreg()) {
+                        log::trace!("place_block_params: VReg {} is not defined in this block, we add it to the block parameters", vreg);
+                        self.block_params.push(self.state.block.index(), (vreg, Allocation::none()));
+                        self.vreg_set.insert(vreg.vreg());
+                    }
+                }
+            }
+        }
+        // TODO: Avoid unsafe
+        let arguments = unsafe { &mut *(self as *mut Self) }.block_params.get_mut(self.state.block.index());
 
         // Stage 1: Just use the current allocation if it is a preg.
-        for (idx, &arg) in arguments.iter().enumerate() {
-            if let Some(current_allocation) = self.tracker.find(arg) {
+        for (vreg, allocation) in &mut *arguments {
+            let vreg = *vreg;
+            if let Some(current_allocation) = self.tracker.find(vreg) {
                 if let Some(preg) = current_allocation.as_reg() {
                     if !blocked_argument_slots.contains(preg) {
-                        self.block_params.set(self.state.block.index() as u32, idx as u32, current_allocation);
+                        log::trace!("place_block_params: VReg {} is already allocated to preg {}", vreg, preg);
+                        *allocation = current_allocation;
                         blocked_argument_slots.add(preg);
+                        self.tracker.free(vreg);
                         continue;
                     }
                 }
@@ -324,35 +372,56 @@ impl<'a, F: Function> Anion<'a, F> {
         }
 
         // Stage 2: Allocate the arguments to pregs.
-        for (idx, &arg) in arguments.iter().enumerate() {
-            let block_param_allocation = self.block_params.get_mut(self.state.block.index() as u32, idx as u32);
-            if (*block_param_allocation).is_some() {
+        for (vreg, allocation) in &mut *arguments {
+            let vreg = *vreg;
+            if (*allocation).is_some() {
                 // The argument is already allocated.
                 continue;
             }
 
             // Find a preg to allocate the argument to.
-            let class = arg.class();
+            let class = vreg.class();
             if let Some(reg) = self.tracker.find_free_preg(class, blocked_argument_slots) {
-                *block_param_allocation = Allocation::reg(reg);
-                let block_param_allocation = *block_param_allocation;
+                log::trace!("place_block_params: Found free preg {} for VReg {}", reg, vreg);
+                *allocation = Allocation::reg(reg);
                 blocked_argument_slots.add(reg);
-                self.move_vreg(arg, block_param_allocation, PRegSet::empty())?;
+                self.move_vreg(vreg, *allocation, PRegSet::empty())?;
+                self.tracker.free(vreg);
                 continue;
             }
         }
 
-        // Stage 3: Allocate the remaining arguments to spillslots.
-        for (idx, &arg) in arguments.iter().enumerate() {
-            let block_param_allocation = self.block_params.get_mut(self.state.block.index() as u32, idx as u32);
-            if (*block_param_allocation).is_some() {
+        // Stage 3: Allocate the remaining arguments to pregs, spilling their current allocation if necessary.
+        for (vreg, allocation) in &mut *arguments {
+            let vreg = *vreg;
+            if (*allocation).is_some() {
                 // The argument is already allocated.
                 continue;
             }
 
-            *block_param_allocation = Allocation::stack(self.tracker.reserve_spillslot(arg.class()));
-            let block_param_allocation = *block_param_allocation;
-            self.move_vreg(arg, block_param_allocation, PRegSet::empty())?;
+            // Find a preg to allocate the argument to.
+            let class = vreg.class();
+            if let Some(reg) = self.tracker.find_furthest_use_preg(class, blocked_argument_slots) {
+                log::trace!("place_block_params: Found furthest use preg {} for VReg {}", reg, vreg);
+                *allocation = Allocation::reg(reg);
+                blocked_argument_slots.add(reg);
+                self.spill_preg(reg);
+                self.tracker.free(vreg);
+                continue;
+            }
+        }
+
+        // Stage 4: Allocate the remaining arguments to spillslots.
+        for (vreg, allocation) in arguments {
+            let vreg = *vreg;
+            if (*allocation).is_some() {
+                // The argument is already allocated.
+                continue;
+            }
+
+            *allocation = Allocation::stack(self.tracker.reserve_spillslot(vreg.class()));
+            log::trace!("place_block_params: VReg {} moved to spillslot", vreg);
+            self.move_vreg(vreg, *allocation, PRegSet::empty())?;
         }
 
         Ok(())
@@ -1126,15 +1195,16 @@ impl<'a, F: Function> Anion<'a, F> {
 
     #[inline]
     fn spill_preg(&mut self, preg: PReg) {
-        let vreg = self.tracker.find(preg).unwrap();
-        let spillslot = Allocation::stack(self.tracker.reserve_spillslot(vreg.class()));
-        log::trace!("spill_preg: Spilling allocation {} to spillslot {}", preg, spillslot);
-        self.tracker.free(vreg);
-        self.tracker.allocate(&self.state, vreg, spillslot);
-        self.edits.push(&self.state, Edit::Move {
-            from: spillslot,
-            to: Allocation::reg(preg),
-        });
+        if let Some(vreg) = self.tracker.find(preg) {
+            let spillslot = Allocation::stack(self.tracker.reserve_spillslot(vreg.class()));
+            log::trace!("spill_preg: Spilling allocation {} to spillslot {}", preg, spillslot);
+            self.tracker.free(vreg);
+            self.tracker.allocate(&self.state, vreg, spillslot);
+            self.edits.push(&self.state, Edit::Move {
+                from: spillslot,
+                to: Allocation::reg(preg),
+            });
+        }
     }
 }
 
@@ -1152,9 +1222,33 @@ mod test {
     use super::*;
     use std::{println, vec};
 
-    use crate::fuzzing::func::{Func, FuncBuilder, InstData, InstOpcode, machine_env};
+    use crate::fuzzing::func::{Func, FuncBuilder, InstData, InstOpcode, machine_env, Options};
     use crate::{Operand, OperandConstraint, OperandKind, OperandPos, RegClass};
     use crate::fuzzing::arbitrary::{Arbitrary, Unstructured};
+
+    #[test]
+    fn fuzz_fail() {
+        env_logger::init();
+        let env = machine_env();
+        let crash = include_bytes!("../../fuzz/artifacts/anion_checker/minimized-from-f5f8377e6e2e8436f472612f61c12591bcc16866");
+        let mut unstructured = Unstructured::new(crash);
+        let func = Func::arbitrary_with_options(
+            &mut unstructured,
+            &Options {
+                reused_inputs: false,
+                fixed_regs: true,
+                fixed_nonallocatable: true,
+                clobbers: true,
+                reftypes: true,
+            }
+        ).unwrap();
+        println!("{:?}", &func);
+        let result = run(&func, &env).unwrap();
+        println!("{:?}", result);
+        let mut checker = crate::checker::Checker::new(&func, &env);
+        checker.prepare(&result);
+        checker.run().unwrap();
+    }
 
     #[test]
     fn test() {
